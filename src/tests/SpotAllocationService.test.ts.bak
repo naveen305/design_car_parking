@@ -1,0 +1,139 @@
+import { SpotAllocationService } from '../../services/SpotAllocationService';
+import { InMemorySpotRepository } from '../../repositories/InMemorySpotRepository';
+import { VehicleType, SpotSize, SpotStatus } from '../../models/enums';
+import { ParkingSpot } from '../../models/ParkingSpot';
+import { v4 as uuidv4 } from 'uuid';
+
+/** Helper to build a ParkingSpot with sensible defaults */
+const makeSpot = (
+  size: SpotSize,
+  floorNumber: number,
+  spotNumber: number,
+  status: SpotStatus = SpotStatus.AVAILABLE
+): ParkingSpot => ({
+  id: uuidv4(),
+  floorNumber,
+  spotNumber,
+  size,
+  status,
+});
+
+describe('SpotAllocationService', () => {
+  let repo: InMemorySpotRepository;
+  let service: SpotAllocationService;
+
+  beforeEach(() => {
+    repo = new InMemorySpotRepository();
+    service = new SpotAllocationService(repo);
+  });
+
+  describe('vehicle → spot size compatibility', () => {
+    it('allocates a SMALL spot for a MOTORCYCLE', async () => {
+      await repo.saveBulk([makeSpot(SpotSize.SMALL, 1, 1)]);
+      const spot = await service.allocate(VehicleType.MOTORCYCLE);
+      expect(spot.size).toBe(SpotSize.SMALL);
+      expect(spot.status).toBe(SpotStatus.OCCUPIED);
+    });
+
+    it('falls back to MEDIUM spot when no SMALL available for MOTORCYCLE', async () => {
+      await repo.saveBulk([makeSpot(SpotSize.MEDIUM, 1, 1)]);
+      const spot = await service.allocate(VehicleType.MOTORCYCLE);
+      expect(spot.size).toBe(SpotSize.MEDIUM);
+    });
+
+    it('allocates a MEDIUM spot for a CAR', async () => {
+      await repo.saveBulk([makeSpot(SpotSize.MEDIUM, 1, 1)]);
+      const spot = await service.allocate(VehicleType.CAR);
+      expect(spot.size).toBe(SpotSize.MEDIUM);
+    });
+
+    it('falls back to LARGE spot when no MEDIUM available for CAR', async () => {
+      await repo.saveBulk([makeSpot(SpotSize.LARGE, 1, 1)]);
+      const spot = await service.allocate(VehicleType.CAR);
+      expect(spot.size).toBe(SpotSize.LARGE);
+    });
+
+    it('allocates a LARGE spot for a BUS', async () => {
+      await repo.saveBulk([makeSpot(SpotSize.LARGE, 1, 1)]);
+      const spot = await service.allocate(VehicleType.BUS);
+      expect(spot.size).toBe(SpotSize.LARGE);
+    });
+
+    it('throws 503 when no compatible spot exists for a BUS', async () => {
+      // Only SMALL and MEDIUM spots available
+      await repo.saveBulk([
+        makeSpot(SpotSize.SMALL, 1, 1),
+        makeSpot(SpotSize.MEDIUM, 1, 2),
+      ]);
+      await expect(service.allocate(VehicleType.BUS)).rejects.toMatchObject({
+        statusCode: 503,
+      });
+    });
+  });
+
+  describe('nearest-first greedy allocation', () => {
+    it('picks the lowest floor, lowest spot number first', async () => {
+      await repo.saveBulk([
+        makeSpot(SpotSize.MEDIUM, 3, 1), // floor 3 — should not be picked
+        makeSpot(SpotSize.MEDIUM, 1, 5), // floor 1, spot 5
+        makeSpot(SpotSize.MEDIUM, 1, 2), // floor 1, spot 2 ← nearest
+      ]);
+      const spot = await service.allocate(VehicleType.CAR);
+      expect(spot.floorNumber).toBe(1);
+      expect(spot.spotNumber).toBe(2);
+    });
+  });
+
+  describe('spot status lifecycle', () => {
+    it('marks a spot OCCUPIED after allocation', async () => {
+      const original = makeSpot(SpotSize.MEDIUM, 1, 1);
+      await repo.saveBulk([original]);
+
+      const allocated = await service.allocate(VehicleType.CAR);
+      expect(allocated.status).toBe(SpotStatus.OCCUPIED);
+    });
+
+    it('releases a spot back to AVAILABLE', async () => {
+      const original = makeSpot(SpotSize.MEDIUM, 1, 1);
+      await repo.saveBulk([original]);
+
+      const allocated = await service.allocate(VehicleType.CAR);
+      const released = await service.release(allocated.id);
+      expect(released.status).toBe(SpotStatus.AVAILABLE);
+    });
+  });
+
+  describe('concurrency — no double booking', () => {
+    it('assigns two different spots when two allocations run concurrently', async () => {
+      await repo.saveBulk([
+        makeSpot(SpotSize.MEDIUM, 1, 1),
+        makeSpot(SpotSize.MEDIUM, 1, 2),
+      ]);
+
+      // Fire both at the same time
+      const [spot1, spot2] = await Promise.all([
+        service.allocate(VehicleType.CAR),
+        service.allocate(VehicleType.CAR),
+      ]);
+
+      expect(spot1.id).not.toBe(spot2.id);
+      expect(spot1.status).toBe(SpotStatus.OCCUPIED);
+      expect(spot2.status).toBe(SpotStatus.OCCUPIED);
+    });
+
+    it('throws 503 on the third concurrent request when only 2 spots exist', async () => {
+      await repo.saveBulk([
+        makeSpot(SpotSize.MEDIUM, 1, 1),
+        makeSpot(SpotSize.MEDIUM, 1, 2),
+      ]);
+
+      await expect(
+        Promise.all([
+          service.allocate(VehicleType.CAR),
+          service.allocate(VehicleType.CAR),
+          service.allocate(VehicleType.CAR),
+        ])
+      ).rejects.toMatchObject({ statusCode: 503 });
+    });
+  });
+});
